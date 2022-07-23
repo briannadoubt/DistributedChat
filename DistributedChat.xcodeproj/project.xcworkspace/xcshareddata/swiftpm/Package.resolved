@@ -1,0 +1,41 @@
+{
+  "pins" : [
+    {
+      "identity" : "reversedscrollview",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/briannadoubt/ReversedScrollView.git",
+      "state" : {
+        "revision" : "08604cf021b3d7b1acdb869832a1aee2f3b70156",
+        "version" : "1.0.1"
+      }
+    },
+    {
+      "identity" : "swift-atomics",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-atomics.git",
+      "state" : {
+        "revision" : "919eb1d83e02121cdb434c7bfc1f0c66ef17febe",
+        "version" : "1.0.2"
+      }
+    },
+    {
+      "identity" : "swift-nio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-nio",
+      "state" : {
+        "revision" : "124119f0bb12384cef35aa041d7c3a686108722d",
+        "version" : "2.40.0"
+      }
+    },
+    {
+      "identity" : "swift-nio-transport-services",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-nio-transport-services.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "94645c8fcd53cfdc970f25f1df5cb70dd4b8696a"
+      }
+    }
+  ],
+  "version" : 2
+}

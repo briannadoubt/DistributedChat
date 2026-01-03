@@ -33,13 +33,11 @@ public distributed actor Chat: Codable, Identifiable {
     distributed func send(_ message: Message) {
         Task {
             do {
+                // observer.send() handles both local storage AND broadcasting to all peers
+                // No need to also loop through otherChats here - that was causing double-sends
                 try await observer.send(message: message, to: self)
-                for chat in observer.otherChats {
-                    try await chat.recieve(message: message, on: chat)
-                }
             } catch {
-                print(error)
-                
+                log("Chat", "[error] Failed to send message: \(error)")
             }
         }
     }

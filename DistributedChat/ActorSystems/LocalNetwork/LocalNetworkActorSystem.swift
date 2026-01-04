@@ -484,6 +484,13 @@ extension LocalNetworkActorSystem {
 
         let callID = UUID()
 
+        // Ensure cleanup happens regardless of success or failure (timeout)
+        defer {
+            self.replyLock.lock()
+            self.inFlightCalls.removeValue(forKey: callID)
+            self.replyLock.unlock()
+        }
+
         // Use withThrowingTaskGroup for timeout handling
         return try await withThrowingTaskGroup(of: Data.self) { group in
             // Add the main task that waits for the reply
@@ -510,11 +517,6 @@ extension LocalNetworkActorSystem {
 
             // Cancel remaining tasks
             group.cancelAll()
-
-            // Clean up the in-flight call
-            self.replyLock.lock()
-            self.inFlightCalls.removeValue(forKey: callID)
-            self.replyLock.unlock()
 
             return result
         }

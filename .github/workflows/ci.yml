@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, 'claude/**' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test-ios:
+    name: Build & Test (iOS)
+    runs-on: macos-14
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Select Xcode
+      run: sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
+
+    - name: Show Xcode version
+      run: xcodebuild -version
+
+    - name: List available simulators
+      run: xcrun simctl list devices available
+
+    - name: Build for iOS
+      run: |
+        xcodebuild build \
+          -project DistributedChat.xcodeproj \
+          -scheme DistributedChat \
+          -destination 'platform=iOS Simulator,name=iPhone 15,OS=17.2' \
+          -configuration Debug \
+          CODE_SIGNING_ALLOWED=NO \
+          | xcpretty --color
+
+    - name: Run Tests (iOS)
+      run: |
+        xcodebuild test \
+          -project DistributedChat.xcodeproj \
+          -scheme DistributedChat \
+          -destination 'platform=iOS Simulator,name=iPhone 15,OS=17.2' \
+          -configuration Debug \
+          CODE_SIGNING_ALLOWED=NO \
+          | xcpretty --color --report junit --output test-results.xml
+
+    - name: Upload Test Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-ios
+        path: test-results.xml
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-14
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Select Xcode
+      run: sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
+
+    - name: Show Xcode version
+      run: xcodebuild -version
+
+    - name: Build for macOS
+      run: |
+        xcodebuild build \
+          -project DistributedChat.xcodeproj \
+          -scheme DistributedChat \
+          -destination 'platform=macOS' \
+          -configuration Debug \
+          CODE_SIGNING_ALLOWED=NO \
+          | xcpretty --color
+
+  lint:
+    name: Swift Lint
+    runs-on: macos-14
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install SwiftLint
+      run: brew install swiftlint
+
+    - name: Run SwiftLint
+      run: swiftlint lint --reporter github-actions-logging || true

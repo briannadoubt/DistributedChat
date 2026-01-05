@@ -7,6 +7,11 @@
 
 import SwiftUI
 
+// Global singleton for the distributed actor system
+// This ensures all actors share the same peer connections
+@available(iOS 16.0, macOS 13.0, *)
+let localNetworkSystem = LocalNetworkActorSystem()
+
 class AppState: ObservableObject {
     @Published var chats: [UUID] = []
     @Published var username: String?

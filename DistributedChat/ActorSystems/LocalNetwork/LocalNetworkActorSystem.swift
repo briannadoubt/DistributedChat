@@ -28,16 +28,25 @@ final public class LocalNetworkActorSystem: DistributedActorSystem,
 
     private var managedActors: [ActorID: any DistributedActor] = [:]
 
+    // Mapping from ActorID to the node name that owns it (for proper routing)
+    private var actorToNodeMapping: [ActorID: String] = [:]
+
     private let nwListener: NWListener
     private let browser: Browser
 
-    var peers: [Peer]
+    // Use dictionary keyed by node name for deduplication
+    private var peersByNodeName: [String: Peer] = [:]
+    var peers: [Peer] { Array(peersByNodeName.values) }
+
     private var _receptionist: LocalNetworkReceptionist!
 
     // === Handle replies
     public typealias CallID = UUID
     private let replyLock = NSLock()
     private var inFlightCalls: [CallID: CheckedContinuation<Data, Error>] = [:]
+
+    // Timeout for in-flight calls (in seconds)
+    private let callTimeout: TimeInterval = 30.0
 
     var _onPeersChanged: ([Peer]) -> Void = { _ in }
 
@@ -53,7 +62,7 @@ final public class LocalNetworkActorSystem: DistributedActorSystem,
         self.nwListener = try! Self.makeNWListener(nodeName: nodeName, serviceName: serviceName)
         self.browser = Browser(nodeName: nodeName, serviceName: serviceName)
 
-        self.peers = []
+        // peersByNodeName is already initialized as empty dictionary
 
         // Initialize "system actors"
         self._receptionist = LocalNetworkReceptionist(actorSystem: self)
@@ -77,9 +86,23 @@ final public class LocalNetworkActorSystem: DistributedActorSystem,
         nwListener.service = NWListener.Service(name: self.nodeName, type: self.serviceName, txtRecord: txtRecord)
 
         nwListener.newConnectionHandler = { (connection: NWConnection) in
-            let con = Connection(connection: connection, deliverMessage: { data, nwMessage in
-                self.decodeAndDeliver(data: data, nwMessage: nwMessage, from: connection)
-            })
+            // Extract node name from endpoint for cleanup on disconnect
+            var peerNodeName: String?
+            if case NWEndpoint.service(let endpointName, _, _, _) = connection.endpoint {
+                peerNodeName = endpointName
+            }
+
+            let con = Connection(
+                connection: connection,
+                deliverMessage: { data, nwMessage in
+                    self.decodeAndDeliver(data: data, nwMessage: nwMessage, from: connection)
+                },
+                onDisconnect: { [weak self] in
+                    if let nodeName = peerNodeName {
+                        self?.removePeer(nodeName: nodeName)
+                    }
+                }
+            )
             _ = self.addPeer(connection: con, from: "listener")
 
             connection.start(queue: .main)
@@ -91,6 +114,12 @@ final public class LocalNetworkActorSystem: DistributedActorSystem,
             self.lock.lock()
             defer {
                 self.lock.unlock()
+            }
+
+            // Extract node name from endpoint for cleanup on disconnect
+            var peerNodeName: String?
+            if case NWEndpoint.service(let endpointName, _, _, _) = result.endpoint {
+                peerNodeName = endpointName
             }
 
             // -----
@@ -108,42 +137,80 @@ final public class LocalNetworkActorSystem: DistributedActorSystem,
             let nwConnection = NWConnection(to: result.endpoint, using: parameters)
             // -----
 
-            let connection = Connection(connection: nwConnection, deliverMessage: { data, nwMessage in
-                self.decodeAndDeliver(data: data, nwMessage: nwMessage, from: nwConnection)
-            })
+            let connection = Connection(
+                connection: nwConnection,
+                deliverMessage: { data, nwMessage in
+                    self.decodeAndDeliver(data: data, nwMessage: nwMessage, from: nwConnection)
+                },
+                onDisconnect: { [weak self] in
+                    if let nodeName = peerNodeName {
+                        self?.removePeer(nodeName: nodeName)
+                    }
+                }
+            )
 
             _ = self.addPeer(connection: connection, from: "browser")
         }
     }
 
     private func addPeer(connection: Connection, from: String) -> Peer? {
-        // Peer management should be vastly improved if we needed this sample to
-        // extend into a production ready application. We must be able to tell peers
-        // coming in from the same "node" on different connections, and only use one
-        // of them for communication.
+        var peerNodeName: String?
 
         if case NWEndpoint.service(let endpointName, let type, let domain, let interface) = connection.connection.endpoint {
-            print("TYPE:", type)
-            print("DOMAIN:", domain)
-            print("INTERFACE:", interface)
-            
+            log("peer", "Adding peer from \(from): type=\(type), domain=\(domain), interface=\(String(describing: interface))")
+
+            // Don't connect to ourselves
             if self.nodeName == endpointName {
+                log("peer", "Ignoring self connection: \(endpointName)")
                 return nil
             }
 
+            // Only accept valid peer names
             guard endpointName.starts(with: "peer_") else {
+                log("peer", "Ignoring non-peer endpoint: \(endpointName)")
                 return nil
             }
-            
-            
+
+            peerNodeName = endpointName
         }
 
-        let peer = Peer(connection: connection)
-        self.peers.append(peer)
+        guard let nodeName = peerNodeName else {
+            log("peer", "Could not determine node name for connection")
+            return nil
+        }
 
+        // Deduplication: If we already have a peer with this node name, don't add another
+        if peersByNodeName[nodeName] != nil {
+            log("peer", "Already connected to node: \(nodeName), ignoring duplicate")
+            return nil
+        }
+
+        let peer = Peer(connection: connection, nodeName: nodeName)
+        self.peersByNodeName[nodeName] = peer
+
+        log("peer", "Added peer: \(nodeName) (total peers: \(peersByNodeName.count))")
         self._onPeersChanged(self.peers)
 
         return peer
+    }
+
+    /// Remove a peer by node name (called when connection fails)
+    func removePeer(nodeName: String) {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+
+        if let _ = peersByNodeName.removeValue(forKey: nodeName) {
+            log("peer", "Removed peer: \(nodeName) (remaining peers: \(peersByNodeName.count))")
+            self._onPeersChanged(self.peers)
+        }
+    }
+
+    /// Register that an actor ID belongs to a specific node
+    func registerActorNode(_ actorID: ActorID, nodeName: String) {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        actorToNodeMapping[actorID] = nodeName
+        log("routing", "Registered actor \(actorID) -> node \(nodeName)")
     }
 
     /// Receive inbound message `Data` and continue to decode, and invoke the local target.
@@ -311,27 +378,32 @@ extension LocalNetworkActorSystem {
         Err: Error,
         Res: Codable {
         log("remoteCall", "remoteCall [\(target)] on remote \(actor.id)")
+
+        // Try to find the specific peer for this actor
+        let targetPeer = selectPeer(for: actor.id)
+
         self.lock.lock()
+        let allPeers = Array(peersByNodeName.values)
+        self.lock.unlock()
 
-        guard !peers.isEmpty else {
+        guard !allPeers.isEmpty else {
             log("remoteCall", "No peers")
-
-            self.lock.unlock()
             throw LocalNetworkActorSystemError.noPeers
         }
 
         let replyData = try await withCallIDContinuation(recipient: actor) { callID in
-            // In this naive sample implementation, we are prepared to really just work
-            // between two peers for the sample app purposes. In a real system implementation
-            // we should select the right peer (connection) for the given actor (i.e.
-            // since we know where it is located, based the ID to connection mappings),
-            // and then select only that specific peer.
-            //
-            // In this naive implementation though, we simply broadcast the remote call.
-            for peer in self.peers {
+            if let peer = targetPeer {
+                // Route to specific peer that owns this actor
+                log("remoteCall", "Routing to specific peer: \(peer.nodeName)")
                 self.sendRemoteCall(to: actor, target: target, invocation: invocation, callID: callID, peer: peer)
+            } else {
+                // Fallback: broadcast to all peers (for receptionist or unknown actors)
+                // This should only happen during initial discovery
+                log("remoteCall", "Broadcasting to all \(allPeers.count) peers (no specific routing)")
+                for peer in allPeers {
+                    self.sendRemoteCall(to: actor, target: target, invocation: invocation, callID: callID, peer: peer)
+                }
             }
-            self.lock.unlock()
         }
 
         let decoder = JSONDecoder()
@@ -354,27 +426,31 @@ extension LocalNetworkActorSystem {
         Act.ID == ActorID,
         Err: Error {
         log("system", "remoteCallVoid [\(target)] on remote \(actor.id)")
-        self.lock.lock()
 
-        guard !peers.isEmpty else {
-            log("remoteCall", "No peers")
-            // throw SampleLocalNetworkActorSystemError.noPeers
-            self.lock.unlock()
+        // Try to find the specific peer for this actor
+        let targetPeer = selectPeer(for: actor.id)
+
+        self.lock.lock()
+        let allPeers = Array(peersByNodeName.values)
+        self.lock.unlock()
+
+        guard !allPeers.isEmpty else {
+            log("remoteCall", "No peers available")
             return
         }
 
         _ = try await withCallIDContinuation(recipient: actor) { callID in
-            // In this naive sample implementation, we are prepared to really just work
-            // between two peers for the sample app purposes. In a real system implementation
-            // we should select the right peer (connection) for the given actor (i.e.
-            // since we know where it is located, based the ID to connection mappings),
-            // and then select only that specific peer.
-            //
-            // In this naive implementation though, we simply broadcast the remote call.
-            for peer in self.peers {
+            if let peer = targetPeer {
+                // Route to specific peer that owns this actor
+                log("remoteCallVoid", "Routing to specific peer: \(peer.nodeName)")
                 self.sendRemoteCall(to: actor, target: target, invocation: invocation, callID: callID, peer: peer)
+            } else {
+                // Fallback: broadcast to all peers (for receptionist or unknown actors)
+                log("remoteCallVoid", "Broadcasting to all \(allPeers.count) peers")
+                for peer in allPeers {
+                    self.sendRemoteCall(to: actor, target: target, invocation: invocation, callID: callID, peer: peer)
+                }
             }
-            self.lock.unlock()
         }
     }
 
@@ -405,14 +481,44 @@ extension LocalNetworkActorSystem {
 
     private func withCallIDContinuation<Act>(recipient: Act, body: (CallID) -> Void) async throws -> Data
         where Act: DistributedActor {
-        try await withCheckedThrowingContinuation { continuation in
+
+        let callID = UUID()
+
+        // Ensure cleanup happens regardless of success or failure (timeout)
+        defer {
             self.replyLock.lock()
-            defer {
-                self.replyLock.unlock()
+            self.inFlightCalls.removeValue(forKey: callID)
+            self.replyLock.unlock()
+        }
+
+        // Use withThrowingTaskGroup for timeout handling
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            // Add the main task that waits for the reply
+            group.addTask {
+                try await withCheckedThrowingContinuation { continuation in
+                    self.replyLock.lock()
+                    self.inFlightCalls[callID] = continuation
+                    self.replyLock.unlock()
+
+                    body(callID)
+                }
             }
-            let callID = UUID()
-            self.inFlightCalls[callID] = continuation
-            body(callID)
+
+            // Add a timeout task
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(self.callTimeout * 1_000_000_000))
+                throw LocalNetworkActorSystemError.callTimeout(callID: callID)
+            }
+
+            // Wait for the first task to complete (either reply or timeout)
+            guard let result = try await group.next() else {
+                throw LocalNetworkActorSystemError.callTimeout(callID: callID)
+            }
+
+            // Cancel remaining tasks
+            group.cancelAll()
+
+            return result
         }
     }
 }
@@ -422,20 +528,22 @@ extension LocalNetworkActorSystem {
 
 @available(iOS 16.0, *)
 extension LocalNetworkActorSystem {
-    func sendReply(_ envelope: ReplyEnvelope) throws {
+    func sendReply(_ envelope: ReplyEnvelope, to peerNodeName: String? = nil) throws {
         self.lock.lock()
-        defer {
-            self.lock.unlock()
+        let peersToSend: [Peer]
+        if let nodeName = peerNodeName, let peer = peersByNodeName[nodeName] {
+            peersToSend = [peer]
+        } else {
+            // Fallback: send to all peers if we don't know the source
+            peersToSend = Array(peersByNodeName.values)
         }
+        self.lock.unlock()
 
         let encoder = JSONEncoder()
         let data = try encoder.encode(envelope)
 
-        // A more advanced implementation would pick the right connection rather than
-        // send to all peers. For this sample app this is enough though, since we
-        // assume two peers.
-        for peer in self.peers {
-            print("reply", "Sending reply for [\(envelope.callID)] on \(peer.connection.connection)")
+        for peer in peersToSend {
+            log("reply", "Sending reply for [\(envelope.callID)] to \(peer.nodeName)")
             peer.connection.sendReply(data)
         }
     }
@@ -447,8 +555,23 @@ extension LocalNetworkActorSystem {
 @available(iOS 16.0, *)
 extension LocalNetworkActorSystem {
     func selectPeer(for id: ActorID) -> Peer? {
-        // Naive implementation; would normally need to maintain an ID -> Peer mapping.
-        self.peers.first
+        self.lock.lock()
+        defer { self.lock.unlock() }
+
+        // Look up which node owns this actor
+        if let nodeName = actorToNodeMapping[id] {
+            return peersByNodeName[nodeName]
+        }
+
+        // Fallback: if we don't know the mapping yet, return nil
+        // The caller should handle this by broadcasting or failing gracefully
+        return nil
+    }
+
+    func selectPeersForBroadcast() -> [Peer] {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        return Array(peersByNodeName.values)
     }
 }
 
@@ -498,6 +621,8 @@ public enum LocalNetworkActorSystemError: Error, DistributedActorSystemError {
     case noPeers
     case notEnoughArgumentsInEnvelope(expected: Any.Type)
     case failedDecodingResponse(data: Data, error: Error)
+    case callTimeout(callID: UUID)
+    case connectionFailed(nodeName: String)
 }
 
 // ==== ----------------------------------------------------------------------------------------------------------------
@@ -526,6 +651,12 @@ enum NetworkServiceConstants {
 @available(iOS 16.0, *)
 struct Peer: Sendable {
     let connection: Connection
+    let nodeName: String
+
+    init(connection: Connection, nodeName: String) {
+        self.connection = connection
+        self.nodeName = nodeName
+    }
 }
 
 @available(iOS 16.0, *)
